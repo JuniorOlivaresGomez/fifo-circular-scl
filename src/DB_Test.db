@@ -1,0 +1,57 @@
+﻿TYPE "UDT_FifoItem"
+VERSION : 0.1
+   STRUCT
+      PartID : DInt;   // Numero correlativo de la pieza
+      Destino : Int;   // 0: sin clasificar, 1 = salida 1, 2 = salida 2, 3 : final
+      Valor : Int;   // Valor crudo de la vision, para diagnostico
+      TEntrada : Time;   // Momento de entrada a la FIFO, para calcular el transito
+   END_STRUCT;
+
+END_TYPE
+
+TYPE "UDT_FIFO"
+VERSION : 0.1
+   STRUCT
+      Buffer { S7_SetPoint := 'False'} : Array[0..9] of "UDT_FifoItem";   // 10 CASILLAS
+      Head { ExternalWritable := 'False'; S7_SetPoint := 'True'} : Int;   // Indice de lectura (elemento mas antiguo-de donde sale la proxima pieza)
+      Tail { ExternalWritable := 'False'} : Int;   // Indice de escritura (proxima casilla libre-donde entra la proxima pieza)
+      Count { ExternalWritable := 'False'} : Int;   // Elementos guardados (saber si esta lleno o vacia)
+      MaxCount : Int;   // Ocupacion maxima historica, se borra con ResetDiag
+      LastOut { S7_SetPoint := 'False'} : "UDT_FifoItem";   // Ultimo elemento extraido
+      Vacio { ExternalWritable := 'False'} : "UDT_FifoItem";   // Plantilla de valores por defecto, NO escribir
+      PushMem { ExternalWritable := 'False'; S7_SetPoint := 'True'} : Bool;   // Memoria de flanco de Push
+      PopMem { ExternalWritable := 'False'} : Bool;   // Memoria de flando de Pop
+      ClearMem { ExternalWritable := 'False'} : Bool;   // Memoria de flanco de Clear
+      LastError : Word;   // Ultimo error, retenido hasta Clear
+      ErrorCount : DInt;   // Errores acumulados,  se borra con ResetDiag
+   END_STRUCT;
+
+END_TYPE
+
+DATA_BLOCK "DB_Test"
+{ S7_Optimized_Access := 'TRUE' }
+VERSION : 0.1
+NON_RETAIN
+   VAR 
+      FifoPrueba { S7_SetPoint := 'False'} : "UDT_FIFO";   // FIFO bajo prueba
+      Push { S7_SetPoint := 'True'} : Bool;   // Orden: meter un dato
+      Pop : Bool;   // Orden: sacar un dato
+      Clear : Bool;   // Orden: vaciar la FIFO
+      ResetDiag : Bool;
+      DataIn { S7_SetPoint := 'False'} : "UDT_FifoItem";   // Dato que se metera con el Push
+      DataOut : "UDT_FifoItem";
+      Peek : "UDT_FifoItem";
+      PushDone { S7_SetPoint := 'True'} : Bool;
+      PopDone : Bool;
+      Empty : Bool;
+      Full : Bool;
+      Count : Int;
+      Error : Bool;
+      Status : Word;
+   END_VAR
+
+
+BEGIN
+
+END_DATA_BLOCK
+
