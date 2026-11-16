@@ -1,0 +1,439 @@
+﻿TYPE "UDT_FifoItem"
+TITLE = Elemento de FIFO
+VERSION : 0.1
+//Datos que viajan con cada pieza: PartID, Destino, Valor, TEntrada. Usado por FC_Fifo v1.1.
+   STRUCT
+      PartID : DInt;   // Numero correlativo de la pieza
+      Destino : Int;   //  0 = sin clasificar, 1 = salida 1, 2 = salida 2, 3 = final
+      Valor : Int;   // Valor crudo de la vision, para diagnostico
+      TEntrada : Time;   // Momento de entrada a la FIFO, para calcular el transito
+   END_STRUCT;
+
+END_TYPE
+
+TYPE "UDT_Fifo"
+TITLE = Estructura de FIFO circular
+VERSION : 0.1
+//Control de FIFO circular: índices Head/Tail/Count, memorias de flanco y diagnóstico. El buffer es un Array separado que se pasa a FC_Fifo.
+   STRUCT
+      Head { ExternalWritable := 'False'} : Int;   // Indice de lectura (elemento mas antiguo-de donde sale la proxima pieza)
+      Tail { ExternalWritable := 'False'} : Int;   // Indice de escritura (proxima casilla libre-donde entra la proxima pieza)
+      Count { ExternalWritable := 'False'} : Int;   // Elementos guardados (saber si esta lleno o vacia)
+      MaxCount { ExternalWritable := 'False'} : Int;   // Ocupacion maxima historica, se borra con ResetDiag
+      LastOut { S7_SetPoint := 'False'} : "UDT_FifoItem";   // Ultimo elemento extraido
+      Vacio { ExternalWritable := 'False'} : "UDT_FifoItem";   // Plantilla de valores por defecto, NO escribir
+      PushMem { ExternalWritable := 'False'} : Bool;   // Memoria de flanco de Push
+      PopMem { ExternalWritable := 'False'} : Bool;   // Memoria de flanco de Pop
+      ClearMem { ExternalWritable := 'False'} : Bool;   // Memoria de flanco de Clear
+      LastError { ExternalWritable := 'False'} : Word;   // Ultimo error, retenido hasta Clear
+      ErrorCount { ExternalWritable := 'False'} : DInt;   // Errores acumulados,  se borra con ResetDiag
+   END_STRUCT;
+
+END_TYPE
+
+FUNCTION "FC_Fifo" : Void
+{ S7_Optimized_Access := 'TRUE' }
+VERSION : 2.0
+   VAR_INPUT 
+      Push : Bool;   // orden: meter DataIn en la FIFO
+      Pop : Bool;   // orden: sacar el elemento mas antiguo
+      Clear : Bool;   // orden: vaciar la FIFO
+      ResetDiag : Bool;   // Borra MaxCount y ErrorCount (por nivel)
+      DataIn : "UDT_FifoItem";   // Dato que se mete con el Push
+   END_VAR
+
+   VAR_OUTPUT 
+      DataOut : "UDT_FifoItem";   // El elemento que acaba de salir del Pop
+      Peek : "UDT_FifoItem";   // El elemento que saldra en el Proximo Pop, sin sacarlo
+      PushDone : Bool;   // TRUE durante 1 ciclo cuando el Push se realizo
+      PopDone : Bool;   // TRUE durante 1 ciclo cuando el Pop se realizo
+      Empty : Bool;   // La FIFO esta VACIA (count = 0)
+      Full : Bool;   // La FIFO esta LLENA (count = C_SIZE)
+      Count : Int;   // Cuantos elementos hay
+      Error : Bool;   // En esta llamada se rechazo una orden
+      Status : Word;   // Codigo que dice que error fue
+   END_VAR
+
+   VAR_IN_OUT 
+      Buffer : Array[*] of "UDT_FifoItem";   // Datos de la FIFO; debe ser la pareja de Fifo
+      Fifo : "UDT_Fifo";   // La FIFO real: FifoTramo1, FifoTramo2 o FifoPrueba
+   END_VAR
+
+   VAR_TEMP 
+      pushEdge : Bool;   // Flanco de Push en esta llamada
+      popEdge : Bool;   // Flanco de Pop en esta llamada
+      clearEdge : Bool;   // Flanco de Clear en esta llamada
+      indicesOk : Bool;   // Estado si los indices son correctos
+      i : Int;   // Variable para iteracion
+      verificacion : DInt;   // Valor calculado para verificar los indices
+      lo : DInt;   // valor minimo
+      hi : DInt;   // valor maximo
+      sizeD : DInt;   // tamaño del buffer
+      size : Int;
+   END_VAR
+
+   VAR CONSTANT 
+      ST_OK : Word := 16#0000;   // Sin Error
+      ST_FULL : Word := 16#8001;   // Push rechazado: FIFO llena
+      ST_EMPTY : Word := 16#8002;   // Pop rechazado: FIFO Vacia
+      ST_CORRUPT : Word := 16#8003;   // Indices incoherentes: FIFO bloqueada hasta un Clear
+      ST_SIZE : Word := 16#8004;   // Buffer con más de 32767 casillas
+      C_DINT_MAX : DInt := 2147483647;   // Limite de saturacion de ErrorCount
+   END_VAR
+
+
+BEGIN
+	// =====================================================================
+	// Bloque   : FC_Fifo
+	// Función  : FIFO circular (Head / Tail / Count) para elementos UDT_FifoItem
+	// Versión  : 2.0  -  2026-11-16  -  Junior
+	//
+	// Contrato de uso:
+	//   - Llamar UNA vez por ciclo por cada FIFO (memorias de flanco en el UDT)
+	//   - No llamar a la misma FIFO desde OB distintos (p. ej. OB1 y OB30)
+	//   - DataOut solo es válido en el ciclo con PopDone = TRUE
+	//   - Revisar Error / Status antes de usar Count, Empty, Full
+	//   - Fifo y Buffer deben ser pareja (FifoTramoN con BufferTramoN): la FC no puede comprobarlo
+	//   - Clear: solo con la línea físicamente vacía
+	//
+	// Órdenes:
+	//   Push, Pop, Clear : por flanco positivo
+	//   ResetDiag        : por nivel (borra MaxCount y ErrorCount)
+	//
+	// Orden de ejecución: Clear -> Validación -> ResetDiag -> Pop -> Push
+	//
+	// Status (válido solo en el ciclo actual; el último queda en Fifo.LastError):
+	//   16#0000  OK
+	//   16#8001  Push rechazado: FIFO llena
+	//   16#8002  Pop rechazado: FIFO vacía
+	//   16#8003  Índices corruptos: FIFO bloqueada hasta Clear (estado, se repite cada ciclo)
+	//   16#8004  Buffer de más de 32767 casillas: FIFO bloqueada
+	//   Si en un mismo ciclo el Pop falla (vacía) y el Push funciona,
+	//   Status = 16#8002 y PushDone = TRUE.
+	//
+	// Historial:
+	//   1.0  Versión inicial
+	//   1.1  Clear ya no borra diagnóstico (nueva entrada ResetDiag);
+	//        saturación de ErrorCount; cabecera y estilo
+	//   2.0  Buffer como Array[*] separado del UDT; tamaño automático con
+	//        LOWER_BOUND/UPPER_BOUND; elimina C_SIZE; nuevo estado 16#8004;
+	//        verificación de coherencia en DInt
+	// =====================================================================
+	
+	REGION 0_TamanoBuffer
+	    //El tamaño sale del array conectado: no hay constante que mantener
+	    #lo := LOWER_BOUND(ARR := #Buffer, DIM := 1); // primer índice (p. ej. 0)
+	    #hi := UPPER_BOUND(ARR := #Buffer, DIM := 1); // último índice (p. ej. 9)
+	    #sizeD := #hi - #lo + 1; // número de casillas
+	    
+	    // Head/Tail/Count son Int: un buffer de más de 32767 casillas
+	    // desbordaría los índices. Se limita aquí y se bloquea abajo
+	    IF #sizeD > 32767 THEN
+	        #size := 0;
+	    ELSE
+	        #size := DINT_TO_INT(#sizeD);
+	    END_IF;
+	    
+	END_REGION
+	
+	
+	REGION 1_InicializarSalidas
+	    // Una FC no tiene memoria: todas las salidas se escriben en CADA llamada.
+	    // Se parte de "no pasó nada"; las regiones siguientes lo modifican.
+	    #PushDone := FALSE;
+	    #PopDone := FALSE;
+	    #Error := FALSE;
+	    #Status := #ST_OK;
+	END_REGION
+	
+	REGION 2_Flancos
+	    // Flanco positivo = valor actual AND NOT valor del ciclo anterior.
+	    // El valor anterior se guarda en el UDT (en el DB) porque Temp
+	    // no conserva su valor entre llamadas.
+	    #pushEdge := #Push AND NOT #Fifo.PushMem;
+	    #Fifo.PushMem := #Push;
+	    
+	    #popEdge := #Pop AND NOT #Fifo.PopMem;
+	    #Fifo.PopMem := #Pop;
+	    
+	    #clearEdge := #Clear AND NOT #Fifo.ClearMem;
+	    #Fifo.ClearMem := #Clear;
+	END_REGION
+	
+	REGION 3_Clear
+	    // Vacía la FIFO (operación). NO borra el diagnóstico (MaxCount,
+	    // ErrorCount): así se conserva la historia después de un incidente.
+	    // Va ANTES de la validación para que esta revise el estado ya limpio
+	    // y no dé una falsa alarma en el ciclo de recuperación.
+	    IF #clearEdge THEN
+	        // En este ciclo no se mete ni se saca nada de la FIFO que se borra
+	        #pushEdge := FALSE;
+	        #popEdge := FALSE;
+	        
+	        FOR #i := 0 TO #size - 1 DO
+	            #Buffer[ #lo + #i] := #Fifo.Vacio;
+	        END_FOR;
+	        
+	        #Fifo.Head := 0;
+	        #Fifo.Tail := 0;
+	        #Fifo.Count := 0;
+	        #Fifo.LastOut := #Fifo.Vacio;
+	        #Fifo.LastError := #ST_OK;
+	    END_IF;
+	END_REGION
+	
+	REGION 4_Validacion
+	    // Protege contra índices imposibles (escritos a mano en el DB,
+	    // Fifo conectada a un buffer de distinto tamaño, errores en otra parte del programa).
+	    // DETECTA y BLOQUEA; nunca repara sola: la reparación es un Clear.
+	    
+	    // A: rangos. Siempre asigna indicesOk.
+	    #indicesOk := (#size > 0) AND (#Fifo.Head >= 0) AND (#Fifo.Head < #size)
+	    AND (#Fifo.Tail >= 0) AND (#Fifo.Tail < #size)
+	    AND (#Fifo.Count >= 0) AND (#Fifo.Count <= #size);
+	    
+	    // B: coherencia. La suma Head + Count puede pasar 32767 con buffers grandes
+	    // así que se calcula en DInt
+	    IF #indicesOk THEN
+	        #verificacion := ( INT_TO_DINT(#Fifo.Head) + INT_TO_DINT(#Fifo.Count) ) MOD #sizeD;
+	        #indicesOk := ( INT_TO_DINT(#Fifo.Tail) = #verificacion );
+	    END_IF;
+	    
+	    // C: avisar y bloquear. No incrementa ErrorCount: la corrupción es un
+	    //    ESTADO que se repite cada ciclo y lo haría crecer sin control.
+	    IF NOT #indicesOk THEN
+	        #Error := TRUE;
+	        IF #size = 0 THEN
+	            #Status := #ST_SIZE;
+	            #Fifo.LastError := #ST_SIZE;
+	        ELSE
+	            #Status := #ST_CORRUPT;
+	            #Fifo.LastError := #ST_CORRUPT;
+	        END_IF;
+	        #pushEdge := FALSE;
+	        #popEdge := FALSE;
+	    END_IF;
+	END_REGION
+	
+	REGION 5_ResetDiag
+	    // Por nivel: repetir el borrado varios ciclos no cambia el resultado.
+	    // MaxCount se iguala a la ocupación actual (no a 0): el máximo desde
+	    // el reset nunca puede ser menor que lo que hay ahora en la FIFO.
+	    IF #ResetDiag THEN
+	        #Fifo.ErrorCount := 0;
+	        IF #indicesOk THEN
+	            #Fifo.MaxCount := #Fifo.Count;
+	        ELSE
+	            #Fifo.MaxCount := 0;
+	        END_IF;
+	    END_IF;
+	END_REGION
+	
+	REGION 6_Pop
+	    // Va ANTES del Push: con la FIFO llena y Push + Pop en el mismo ciclo,
+	    // primero se libera una casilla; con la FIFO vacía, el error queda
+	    // visible en vez de entregar a una caja los datos de otra.
+	    IF #popEdge THEN
+	        IF #Fifo.Count > 0 THEN
+	            #Fifo.LastOut := #Buffer[ #lo + #Fifo.Head];      // leer la más antigua
+	            #Buffer[ #lo + #Fifo.Head] := #Fifo.Vacio;         // limpiar la casilla
+	            
+	            #Fifo.Head := #Fifo.Head + 1;                    // avanzar lectura
+	            IF #Fifo.Head >= #size THEN                    // vuelta circular
+	                #Fifo.Head := 0;
+	            END_IF;
+	            
+	            #Fifo.Count := #Fifo.Count - 1;
+	            #PopDone := TRUE;
+	        ELSE
+	            // FIFO vacía: en el proceso, una caja llegó sin datos (desfase)
+	            #Error := TRUE;
+	            #Status := #ST_EMPTY;
+	            #Fifo.LastError := #ST_EMPTY;
+	            IF #Fifo.ErrorCount < #C_DINT_MAX THEN
+	                #Fifo.ErrorCount := #Fifo.ErrorCount + 1;
+	            END_IF;
+	        END_IF;
+	    END_IF;
+	END_REGION
+	
+	REGION 7_Push
+	    IF #pushEdge THEN
+	        IF #Fifo.Count < #size THEN
+	            #Buffer[ #lo + #Fifo.Tail] := #DataIn;            // escribir en la libre
+	            
+	            #Fifo.Tail := #Fifo.Tail + 1;                    // avanzar escritura
+	            IF #Fifo.Tail >= #size THEN                    // vuelta circular
+	                #Fifo.Tail := 0;
+	            END_IF;
+	            
+	            #Fifo.Count := #Fifo.Count + 1;
+	            IF #Fifo.Count > #Fifo.MaxCount THEN             // récord de ocupación
+	                #Fifo.MaxCount := #Fifo.Count;
+	            END_IF;
+	            
+	            #PushDone := TRUE;
+	        ELSE
+	            // FIFO llena: el dato se pierde. En el proceso significa más cajas
+	            // en el tramo de las físicamente posibles (atasco o cajas sin registrar)
+	            #Error := TRUE;
+	            #Status := #ST_FULL;
+	            #Fifo.LastError := #ST_FULL;
+	            IF #Fifo.ErrorCount < #C_DINT_MAX THEN
+	                #Fifo.ErrorCount := #Fifo.ErrorCount + 1;
+	            END_IF;
+	        END_IF;
+	    END_IF;
+	END_REGION
+	
+	REGION 8_Salidas
+	    // Con la FIFO corrupta, Count / Empty / Full reflejan valores no
+	    // fiables: quien llama debe revisar Error primero (ver contrato).
+	    #Count := #Fifo.Count;
+	    #Empty := (#Fifo.Count = 0);
+	    #Full := (#Fifo.Count >= #size);
+	    #DataOut := #Fifo.LastOut;
+	    
+	    // Peek: la próxima en salir. indicesOk evita leer fuera del array
+	    IF (#Fifo.Count > 0) AND #indicesOk THEN
+	        #Peek := #Buffer[ #lo + #Fifo.Head];
+	    ELSE
+	        #Peek := #Fifo.Vacio;
+	    END_IF;
+	END_REGION
+END_FUNCTION
+
+DATA_BLOCK "DB_Test"
+{ S7_Optimized_Access := 'TRUE' }
+VERSION : 1.1
+NON_RETAIN
+   VAR 
+      FifoPrueba { S7_SetPoint := 'False'} : "UDT_Fifo";   // FIFO bajo prueba
+      FifoChica : "UDT_Fifo";
+      FifoUno : "UDT_Fifo";
+      BufferPrueba : Array[0..9] of "UDT_FifoItem";
+      BufferChico : Array[0..4] of "UDT_FifoItem";
+      BufferUno : Array[1..10] of "UDT_FifoItem";
+      Push { S7_SetPoint := 'True'} : Bool;   // Orden: meter un dato
+      Pop : Bool;   // Orden: sacar un dato
+      Clear : Bool;   // Orden: vaciar la FIFO
+      ResetDiag : Bool;
+      DataIn { S7_SetPoint := 'False'} : "UDT_FifoItem";   // Dato que se metera con el Push
+      DataOut : "UDT_FifoItem";
+      Peek : "UDT_FifoItem";
+      PushDone { S7_SetPoint := 'True'} : Bool;
+      PopDone : Bool;
+      Empty : Bool;
+      Full : Bool;
+      Count : Int;
+      Error : Bool;
+      Status : Word;
+      Push_1 { S7_SetPoint := 'True'} : Bool;   // Orden: meter un dato
+      Pop_1 : Bool;   // Orden: sacar un dato
+      Clear_1 : Bool;   // Orden: vaciar la FIFO
+      ResetDiag_1 : Bool;
+      DataIn_1 { S7_SetPoint := 'False'} : "UDT_FifoItem";   // Dato que se metera con el Push
+      DataOut_1 : "UDT_FifoItem";
+      Peek_1 : "UDT_FifoItem";
+      PushDone_1 { S7_SetPoint := 'True'} : Bool;
+      PopDone_1 : Bool;
+      Empty_1 : Bool;
+      Full_1 : Bool;
+      Count_1 : Int;
+      Error_1 : Bool;
+      Status_1 : Word;
+      Push_2 { S7_SetPoint := 'True'} : Bool;   // Orden: meter un dato
+      Pop_2 : Bool;   // Orden: sacar un dato
+      Clear_2 : Bool;   // Orden: vaciar la FIFO
+      ResetDiag_2 : Bool;
+      DataIn_2 { S7_SetPoint := 'False'} : "UDT_FifoItem";   // Dato que se metera con el Push
+      DataOut_2 : "UDT_FifoItem";
+      Peek_2 : "UDT_FifoItem";
+      PushDone_2 { S7_SetPoint := 'True'} : Bool;
+      PopDone_2 : Bool;
+      Empty_2 : Bool;
+      Full_2 : Bool;
+      Count_2 : Int;
+      Error_2 : Bool;
+      Status_2 : Word;
+   END_VAR
+
+
+BEGIN
+
+END_DATA_BLOCK
+
+FUNCTION "FC_TestFifo" : Void
+{ S7_Optimized_Access := 'TRUE' }
+VERSION : 0.1
+
+BEGIN
+	// =====================================================================
+	// Bloque   : FC_TestFifo
+	// Función  : Banco de pruebas de FC_Fifo v_1.0. Tres FIFO con buffers de
+	//            distinto tamaño y límite inferior, una llamada por FIFO.
+	// Uso      : Llamar desde OB1. Órdenes desde las tablas de observación
+	//            TestFIFO, TestFIFOChica y TestFIFOUno.
+	// =====================================================================
+	
+	REGION FifoPrueba_Array_0_9
+	    // FIFO principal: protocolo P1-P1_2
+	    "FC_Fifo"(Push := "DB_Test".Push,
+	              Pop := "DB_Test".Pop,
+	              Clear := "DB_Test".Clear,
+	              ResetDiag := "DB_Test".ResetDiag,
+	              DataIn := "DB_Test".DataIn,
+	              DataOut => "DB_Test".DataOut,
+	              Peek => "DB_Test".Peek,
+	              PushDone => "DB_Test".PushDone,
+	              PopDone => "DB_Test".PopDone,
+	              Empty => "DB_Test".Empty,
+	              Full => "DB_Test".Full,
+	              Count => "DB_Test".Count,
+	              Error => "DB_Test".Error,
+	              Status => "DB_Test".Status,
+	              Fifo := "DB_Test".FifoPrueba,
+	              Buffer := "DB_Test".BufferPrueba);
+	END_REGION
+	
+	REGION FifoChica_Array_0_4
+	    // P14: el tamaño se adapta solo (5 casillas)
+	    "FC_Fifo"(Push := "DB_Test"."Push_1",
+	              Pop := "DB_Test".Pop_1,
+	              Clear := "DB_Test".Clear_1,
+	              ResetDiag := "DB_Test".ResetDiag_1,
+	              DataIn := "DB_Test".DataIn_1,
+	              DataOut => "DB_Test".DataOut_1,
+	              Peek => "DB_Test".Peek_1,
+	              PushDone => "DB_Test".PushDone_1,
+	              PopDone => "DB_Test".PopDone_1,
+	              Empty => "DB_Test".Empty_1,
+	              Full => "DB_Test".Full_1,
+	              Count => "DB_Test".Count_1,
+	              Error => "DB_Test".Error_1,
+	              Status => "DB_Test".Status_1,
+	              Fifo := "DB_Test".FifoChica,
+	              Buffer := "DB_Test".BufferChico);
+	END_REGION
+	
+	REGION FifoUno_Array_1_10
+	    // P15: límite inferior distinto de 0
+	    "FC_Fifo"(Push := "DB_Test".Push_2,
+	              Pop := "DB_Test".Pop_2,
+	              Clear := "DB_Test".Clear_2,
+	              ResetDiag := "DB_Test".ResetDiag_2,
+	              DataIn := "DB_Test".DataIn_2,
+	              DataOut => "DB_Test".DataOut_2,
+	              Peek => "DB_Test".Peek_2,
+	              PushDone => "DB_Test".PushDone_2,
+	              PopDone => "DB_Test".PopDone_2,
+	              Empty => "DB_Test".Empty_2,
+	              Full => "DB_Test".Full_2,
+	              Count => "DB_Test".Count_2,
+	              Error => "DB_Test".Error_2,
+	              Status => "DB_Test".Status_2,
+	              Fifo := "DB_Test".FifoUno,
+	              Buffer := "DB_Test".BufferUno);
+	END_REGION
+END_FUNCTION
+
