@@ -14,9 +14,8 @@ END_TYPE
 TYPE "UDT_Fifo"
 TITLE = Estructura de FIFO circular
 VERSION : 0.1
-//Buffer[0..9], índices Head/Tail/Count, memorias de flanco y diagnóstico. El tamaño del array debe coincidir con C_SIZE de FC_Fifo.
+//Control de FIFO circular: índices Head/Tail/Count, memorias de flanco y diagnóstico. El buffer es un Array separado que se pasa a FC_Fifo.
    STRUCT
-      Buffer { S7_SetPoint := 'False'} : Array[0..9] of "UDT_FifoItem";   // 10 CASILLAS
       Head { ExternalWritable := 'False'} : Int;   // Indice de lectura (elemento mas antiguo-de donde sale la proxima pieza)
       Tail { ExternalWritable := 'False'} : Int;   // Indice de escritura (proxima casilla libre-donde entra la proxima pieza)
       Count { ExternalWritable := 'False'} : Int;   // Elementos guardados (saber si esta lleno o vacia)
@@ -34,7 +33,7 @@ END_TYPE
 
 FUNCTION "FC_Fifo" : Void
 { S7_Optimized_Access := 'TRUE' }
-VERSION : 1.1
+VERSION : 2.0
    VAR_INPUT 
       Push : Bool;   // orden: meter DataIn en la FIFO
       Pop : Bool;   // orden: sacar el elemento mas antiguo
@@ -56,6 +55,7 @@ VERSION : 1.1
    END_VAR
 
    VAR_IN_OUT 
+      Buffer : Array[*] of "UDT_FifoItem";   // Datos de la FIFO; debe ser la pareja de Fifo
       Fifo : "UDT_Fifo";   // La FIFO real: FifoTramo1, FifoTramo2 o FifoPrueba
    END_VAR
 
@@ -65,15 +65,19 @@ VERSION : 1.1
       clearEdge : Bool;   // Flanco de Clear en esta llamada
       indicesOk : Bool;   // Estado si los indices son correctos
       i : Int;   // Variable para iteracion
-      verificacion : Int;   // Valor calculado para verificar los indices
+      verificacion : DInt;   // Valor calculado para verificar los indices
+      lo : DInt;   // valor minimo
+      hi : DInt;   // valor maximo
+      sizeD : DInt;   // tamaño del buffer
+      size : Int;
    END_VAR
 
    VAR CONSTANT 
-      C_SIZE : Int := 10;   // Tamaño del array: debe coincidir con [0..9]
       ST_OK : Word := 16#0000;   // Sin Error
       ST_FULL : Word := 16#8001;   // Push rechazado: FIFO llena
       ST_EMPTY : Word := 16#8002;   // Pop rechazado: FIFO Vacia
       ST_CORRUPT : Word := 16#8003;   // Indices incoherentes: FIFO bloqueada hasta un Clear
+      ST_SIZE : Word := 16#8004;   // Buffer con más de 32767 casillas
       C_DINT_MAX : DInt := 2147483647;   // Limite de saturacion de ErrorCount
    END_VAR
 
@@ -82,14 +86,14 @@ BEGIN
 	// =====================================================================
 	// Bloque   : FC_Fifo
 	// Función  : FIFO circular (Head / Tail / Count) para elementos UDT_FifoItem
-	// Versión  : 1.1  -  2026-11-15  -  Junior
+	// Versión  : 2.0  -  2026-11-16  -  Junior
 	//
 	// Contrato de uso:
 	//   - Llamar UNA vez por ciclo por cada FIFO (memorias de flanco en el UDT)
 	//   - No llamar a la misma FIFO desde OB distintos (p. ej. OB1 y OB30)
 	//   - DataOut solo es válido en el ciclo con PopDone = TRUE
 	//   - Revisar Error / Status antes de usar Count, Empty, Full
-	//   - C_SIZE debe coincidir con Array[0..C_SIZE-1] de UDT_Fifo
+	//   - Fifo y Buffer deben ser pareja (FifoTramoN con BufferTramoN): la FC no puede comprobarlo
 	//   - Clear: solo con la línea físicamente vacía
 	//
 	// Órdenes:
@@ -103,6 +107,7 @@ BEGIN
 	//   16#8001  Push rechazado: FIFO llena
 	//   16#8002  Pop rechazado: FIFO vacía
 	//   16#8003  Índices corruptos: FIFO bloqueada hasta Clear (estado, se repite cada ciclo)
+	//   16#8004  Buffer de más de 32767 casillas: FIFO bloqueada
 	//   Si en un mismo ciclo el Pop falla (vacía) y el Push funciona,
 	//   Status = 16#8002 y PushDone = TRUE.
 	//
@@ -110,7 +115,27 @@ BEGIN
 	//   1.0  Versión inicial
 	//   1.1  Clear ya no borra diagnóstico (nueva entrada ResetDiag);
 	//        saturación de ErrorCount; cabecera y estilo
+	//   2.0  Buffer como Array[*] separado del UDT; tamaño automático con
+	//        LOWER_BOUND/UPPER_BOUND; elimina C_SIZE; nuevo estado 16#8004;
+	//        verificación de coherencia en DInt
 	// =====================================================================
+	
+	REGION 0_TamanoBuffer
+	    //El tamaño sale del array conectado: no hay constante que mantener
+	    #lo := LOWER_BOUND(ARR := #Buffer, DIM := 1); // primer índice (p. ej. 0)
+	    #hi := UPPER_BOUND(ARR := #Buffer, DIM := 1); // último índice (p. ej. 9)
+	    #sizeD := #hi - #lo + 1; // número de casillas
+	    
+	    // Head/Tail/Count son Int: un buffer de más de 32767 casillas
+	    // desbordaría los índices. Se limita aquí y se bloquea abajo
+	    IF #sizeD > 32767 THEN
+	        #size := 0;
+	    ELSE
+	        #size := DINT_TO_INT(#sizeD);
+	    END_IF;
+	    
+	END_REGION
+	
 	
 	REGION 1_InicializarSalidas
 	    // Una FC no tiene memoria: todas las salidas se escriben en CADA llamada.
@@ -145,8 +170,8 @@ BEGIN
 	        #pushEdge := FALSE;
 	        #popEdge := FALSE;
 	        
-	        FOR #i := 0 TO #C_SIZE - 1 DO
-	            #Fifo.Buffer[#i] := #Fifo.Vacio;
+	        FOR #i := 0 TO #size - 1 DO
+	            #Buffer[ #lo + #i] := #Fifo.Vacio;
 	        END_FOR;
 	        
 	        #Fifo.Head := 0;
@@ -158,28 +183,33 @@ BEGIN
 	END_REGION
 	
 	REGION 4_Validacion
-	    // Protege contra índices imposibles (escritos a mano en el DB, array
-	    // cambiado sin cambiar C_SIZE, errores en otra parte del programa).
+	    // Protege contra índices imposibles (escritos a mano en el DB,
+	    // Fifo conectada a un buffer de distinto tamaño, errores en otra parte del programa).
 	    // DETECTA y BLOQUEA; nunca repara sola: la reparación es un Clear.
 	    
 	    // A: rangos. Siempre asigna indicesOk.
-	    #indicesOk := (#Fifo.Head >= 0) AND (#Fifo.Head < #C_SIZE)
-	    AND (#Fifo.Tail >= 0) AND (#Fifo.Tail < #C_SIZE)
-	    AND (#Fifo.Count >= 0) AND (#Fifo.Count <= #C_SIZE);
+	    #indicesOk := (#size > 0) AND (#Fifo.Head >= 0) AND (#Fifo.Head < #size)
+	    AND (#Fifo.Tail >= 0) AND (#Fifo.Tail < #size)
+	    AND (#Fifo.Count >= 0) AND (#Fifo.Count <= #size);
 	    
-	    // B: coherencia (desde Head, avanzar Count casillas con vuelta = Tail).
-	    //    Solo con rangos válidos, para no desbordar el Int en la suma.
+	    // B: coherencia. La suma Head + Count puede pasar 32767 con buffers grandes
+	    // así que se calcula en DInt
 	    IF #indicesOk THEN
-	        #verificacion := (#Fifo.Head + #Fifo.Count) MOD #C_SIZE;
-	        #indicesOk := (#Fifo.Tail = #verificacion);
+	        #verificacion := ( INT_TO_DINT(#Fifo.Head) + INT_TO_DINT(#Fifo.Count) ) MOD #sizeD;
+	        #indicesOk := ( INT_TO_DINT(#Fifo.Tail) = #verificacion );
 	    END_IF;
 	    
 	    // C: avisar y bloquear. No incrementa ErrorCount: la corrupción es un
 	    //    ESTADO que se repite cada ciclo y lo haría crecer sin control.
 	    IF NOT #indicesOk THEN
 	        #Error := TRUE;
-	        #Status := #ST_CORRUPT;
-	        #Fifo.LastError := #ST_CORRUPT;
+	        IF #size = 0 THEN
+	            #Status := #ST_SIZE;
+	            #Fifo.LastError := #ST_SIZE;
+	        ELSE
+	            #Status := #ST_CORRUPT;
+	            #Fifo.LastError := #ST_CORRUPT;
+	        END_IF;
 	        #pushEdge := FALSE;
 	        #popEdge := FALSE;
 	    END_IF;
@@ -205,11 +235,11 @@ BEGIN
 	    // visible en vez de entregar a una caja los datos de otra.
 	    IF #popEdge THEN
 	        IF #Fifo.Count > 0 THEN
-	            #Fifo.LastOut := #Fifo.Buffer[#Fifo.Head];      // leer la más antigua
-	            #Fifo.Buffer[#Fifo.Head] := #Fifo.Vacio;         // limpiar la casilla
+	            #Fifo.LastOut := #Buffer[ #lo + #Fifo.Head];      // leer la más antigua
+	            #Buffer[ #lo + #Fifo.Head] := #Fifo.Vacio;         // limpiar la casilla
 	            
 	            #Fifo.Head := #Fifo.Head + 1;                    // avanzar lectura
-	            IF #Fifo.Head >= #C_SIZE THEN                    // vuelta circular
+	            IF #Fifo.Head >= #size THEN                    // vuelta circular
 	                #Fifo.Head := 0;
 	            END_IF;
 	            
@@ -229,11 +259,11 @@ BEGIN
 	
 	REGION 7_Push
 	    IF #pushEdge THEN
-	        IF #Fifo.Count < #C_SIZE THEN
-	            #Fifo.Buffer[#Fifo.Tail] := #DataIn;            // escribir en la libre
+	        IF #Fifo.Count < #size THEN
+	            #Buffer[ #lo + #Fifo.Tail] := #DataIn;            // escribir en la libre
 	            
 	            #Fifo.Tail := #Fifo.Tail + 1;                    // avanzar escritura
-	            IF #Fifo.Tail >= #C_SIZE THEN                    // vuelta circular
+	            IF #Fifo.Tail >= #size THEN                    // vuelta circular
 	                #Fifo.Tail := 0;
 	            END_IF;
 	            
@@ -261,12 +291,12 @@ BEGIN
 	    // fiables: quien llama debe revisar Error primero (ver contrato).
 	    #Count := #Fifo.Count;
 	    #Empty := (#Fifo.Count = 0);
-	    #Full := (#Fifo.Count >= #C_SIZE);
+	    #Full := (#Fifo.Count >= #size);
 	    #DataOut := #Fifo.LastOut;
 	    
 	    // Peek: la próxima en salir. indicesOk evita leer fuera del array
 	    IF (#Fifo.Count > 0) AND #indicesOk THEN
-	        #Peek := #Fifo.Buffer[#Fifo.Head];
+	        #Peek := #Buffer[ #lo + #Fifo.Head];
 	    ELSE
 	        #Peek := #Fifo.Vacio;
 	    END_IF;
