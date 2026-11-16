@@ -4,7 +4,7 @@ VERSION : 0.1
 //Datos que viajan con cada pieza: PartID, Destino, Valor, TEntrada. Usado por FC_Fifo v1.1.
    STRUCT
       PartID : DInt;   // Numero correlativo de la pieza
-      Destino : Int;   // 0: sin clasificar, 1 = salida 1, 2 = salida 2, 3 : final
+      Destino : Int;   //  0 = sin clasificar, 1 = salida 1, 2 = salida 2, 3 = final
       Valor : Int;   // Valor crudo de la vision, para diagnostico
       TEntrada : Time;   // Momento de entrada a la FIFO, para calcular el transito
    END_STRUCT;
@@ -20,14 +20,14 @@ VERSION : 0.1
       Head { ExternalWritable := 'False'} : Int;   // Indice de lectura (elemento mas antiguo-de donde sale la proxima pieza)
       Tail { ExternalWritable := 'False'} : Int;   // Indice de escritura (proxima casilla libre-donde entra la proxima pieza)
       Count { ExternalWritable := 'False'} : Int;   // Elementos guardados (saber si esta lleno o vacia)
-      MaxCount { ExternalAccessible := 'False'; ExternalVisible := 'False'; ExternalWritable := 'False'} : Int;   // Ocupacion maxima historica, se borra con ResetDiag
+      MaxCount { ExternalWritable := 'False'} : Int;   // Ocupacion maxima historica, se borra con ResetDiag
       LastOut { S7_SetPoint := 'False'} : "UDT_FifoItem";   // Ultimo elemento extraido
       Vacio { ExternalWritable := 'False'} : "UDT_FifoItem";   // Plantilla de valores por defecto, NO escribir
       PushMem { ExternalWritable := 'False'} : Bool;   // Memoria de flanco de Push
       PopMem { ExternalWritable := 'False'} : Bool;   // Memoria de flanco de Pop
       ClearMem { ExternalWritable := 'False'} : Bool;   // Memoria de flanco de Clear
-      LastError { ExternalAccessible := 'False'; ExternalVisible := 'False'; ExternalWritable := 'False'} : Word;   // Ultimo error, retenido hasta Clear
-      ErrorCount { ExternalAccessible := 'False'; ExternalVisible := 'False'; ExternalWritable := 'False'} : DInt;   // Errores acumulados,  se borra con ResetDiag
+      LastError { ExternalWritable := 'False'} : Word;   // Ultimo error, retenido hasta Clear
+      ErrorCount { ExternalWritable := 'False'} : DInt;   // Errores acumulados,  se borra con ResetDiag
    END_STRUCT;
 
 END_TYPE
