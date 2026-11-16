@@ -1,5 +1,7 @@
 ﻿TYPE "UDT_FifoItem"
+TITLE = Elemento de FIFO
 VERSION : 0.1
+//Datos que viajan con cada pieza: PartID, Destino, Valor, TEntrada. Usado por FC_Fifo v1.1.
    STRUCT
       PartID : DInt;   // Numero correlativo de la pieza
       Destino : Int;   // 0: sin clasificar, 1 = salida 1, 2 = salida 2, 3 : final
@@ -9,28 +11,30 @@ VERSION : 0.1
 
 END_TYPE
 
-TYPE "UDT_FIFO"
+TYPE "UDT_Fifo"
+TITLE = Estructura de FIFO circular
 VERSION : 0.1
+//Buffer[0..9], índices Head/Tail/Count, memorias de flanco y diagnóstico. El tamaño del array debe coincidir con C_SIZE de FC_Fifo.
    STRUCT
       Buffer { S7_SetPoint := 'False'} : Array[0..9] of "UDT_FifoItem";   // 10 CASILLAS
-      Head { ExternalWritable := 'False'; S7_SetPoint := 'True'} : Int;   // Indice de lectura (elemento mas antiguo-de donde sale la proxima pieza)
+      Head { ExternalWritable := 'False'} : Int;   // Indice de lectura (elemento mas antiguo-de donde sale la proxima pieza)
       Tail { ExternalWritable := 'False'} : Int;   // Indice de escritura (proxima casilla libre-donde entra la proxima pieza)
       Count { ExternalWritable := 'False'} : Int;   // Elementos guardados (saber si esta lleno o vacia)
-      MaxCount : Int;   // Ocupacion maxima historica, se borra con ResetDiag
+      MaxCount { ExternalAccessible := 'False'; ExternalVisible := 'False'; ExternalWritable := 'False'} : Int;   // Ocupacion maxima historica, se borra con ResetDiag
       LastOut { S7_SetPoint := 'False'} : "UDT_FifoItem";   // Ultimo elemento extraido
       Vacio { ExternalWritable := 'False'} : "UDT_FifoItem";   // Plantilla de valores por defecto, NO escribir
-      PushMem { ExternalWritable := 'False'; S7_SetPoint := 'True'} : Bool;   // Memoria de flanco de Push
-      PopMem { ExternalWritable := 'False'} : Bool;   // Memoria de flando de Pop
+      PushMem { ExternalWritable := 'False'} : Bool;   // Memoria de flanco de Push
+      PopMem { ExternalWritable := 'False'} : Bool;   // Memoria de flanco de Pop
       ClearMem { ExternalWritable := 'False'} : Bool;   // Memoria de flanco de Clear
-      LastError : Word;   // Ultimo error, retenido hasta Clear
-      ErrorCount : DInt;   // Errores acumulados,  se borra con ResetDiag
+      LastError { ExternalAccessible := 'False'; ExternalVisible := 'False'; ExternalWritable := 'False'} : Word;   // Ultimo error, retenido hasta Clear
+      ErrorCount { ExternalAccessible := 'False'; ExternalVisible := 'False'; ExternalWritable := 'False'} : DInt;   // Errores acumulados,  se borra con ResetDiag
    END_STRUCT;
 
 END_TYPE
 
 FUNCTION "FC_Fifo" : Void
 { S7_Optimized_Access := 'TRUE' }
-VERSION : 0.1
+VERSION : 1.1
    VAR_INPUT 
       Push : Bool;   // orden: meter DataIn en la FIFO
       Pop : Bool;   // orden: sacar el elemento mas antiguo
@@ -45,29 +49,29 @@ VERSION : 0.1
       PushDone : Bool;   // TRUE durante 1 ciclo cuando el Push se realizo
       PopDone : Bool;   // TRUE durante 1 ciclo cuando el Pop se realizo
       Empty : Bool;   // La FIFO esta VACIA (count = 0)
-      Full : Bool;   // La FIFO esta LLENA (count = 10)
+      Full : Bool;   // La FIFO esta LLENA (count = C_SIZE)
       Count : Int;   // Cuantos elementos hay
       Error : Bool;   // En esta llamada se rechazo una orden
-      Status : Word;   // Codigo que dice que eror fue
+      Status : Word;   // Codigo que dice que error fue
    END_VAR
 
    VAR_IN_OUT 
-      Fifo : "UDT_FIFO";   // La FIFO real: FifoTramo1, FifoTramo2 o FifoPrueba
+      Fifo : "UDT_Fifo";   // La FIFO real: FifoTramo1, FifoTramo2 o FifoPrueba
    END_VAR
 
    VAR_TEMP 
       pushEdge : Bool;   // Flanco de Push en esta llamada
       popEdge : Bool;   // Flanco de Pop en esta llamada
-      clearEdge : Bool;
-      indicesOk : Bool;
-      i : Int;
-      verificacion : Int;
+      clearEdge : Bool;   // Flanco de Clear en esta llamada
+      indicesOk : Bool;   // Estado si los indices son correctos
+      i : Int;   // Variable para iteracion
+      verificacion : Int;   // Valor calculado para verificar los indices
    END_VAR
 
    VAR CONSTANT 
       C_SIZE : Int := 10;   // Tamaño del array: debe coincidir con [0..9]
       ST_OK : Word := 16#0000;   // Sin Error
-      ST_FULL : Word := 16#8001;   // Push rechazao: FIFO llena
+      ST_FULL : Word := 16#8001;   // Push rechazado: FIFO llena
       ST_EMPTY : Word := 16#8002;   // Pop rechazado: FIFO Vacia
       ST_CORRUPT : Word := 16#8003;   // Indices incoherentes: FIFO bloqueada hasta un Clear
       C_DINT_MAX : DInt := 2147483647;   // Limite de saturacion de ErrorCount

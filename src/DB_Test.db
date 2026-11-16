@@ -1,5 +1,7 @@
 ﻿TYPE "UDT_FifoItem"
+TITLE = Elemento de FIFO
 VERSION : 0.1
+//Datos que viajan con cada pieza: PartID, Destino, Valor, TEntrada. Usado por FC_Fifo v1.1.
    STRUCT
       PartID : DInt;   // Numero correlativo de la pieza
       Destino : Int;   // 0: sin clasificar, 1 = salida 1, 2 = salida 2, 3 : final
@@ -9,28 +11,30 @@ VERSION : 0.1
 
 END_TYPE
 
-TYPE "UDT_FIFO"
+TYPE "UDT_Fifo"
+TITLE = Estructura de FIFO circular
 VERSION : 0.1
+//Buffer[0..9], índices Head/Tail/Count, memorias de flanco y diagnóstico. El tamaño del array debe coincidir con C_SIZE de FC_Fifo.
    STRUCT
       Buffer { S7_SetPoint := 'False'} : Array[0..9] of "UDT_FifoItem";   // 10 CASILLAS
-      Head { ExternalWritable := 'False'; S7_SetPoint := 'True'} : Int;   // Indice de lectura (elemento mas antiguo-de donde sale la proxima pieza)
+      Head { ExternalWritable := 'False'} : Int;   // Indice de lectura (elemento mas antiguo-de donde sale la proxima pieza)
       Tail { ExternalWritable := 'False'} : Int;   // Indice de escritura (proxima casilla libre-donde entra la proxima pieza)
       Count { ExternalWritable := 'False'} : Int;   // Elementos guardados (saber si esta lleno o vacia)
-      MaxCount : Int;   // Ocupacion maxima historica, se borra con ResetDiag
+      MaxCount { ExternalAccessible := 'False'; ExternalVisible := 'False'; ExternalWritable := 'False'} : Int;   // Ocupacion maxima historica, se borra con ResetDiag
       LastOut { S7_SetPoint := 'False'} : "UDT_FifoItem";   // Ultimo elemento extraido
       Vacio { ExternalWritable := 'False'} : "UDT_FifoItem";   // Plantilla de valores por defecto, NO escribir
-      PushMem { ExternalWritable := 'False'; S7_SetPoint := 'True'} : Bool;   // Memoria de flanco de Push
-      PopMem { ExternalWritable := 'False'} : Bool;   // Memoria de flando de Pop
+      PushMem { ExternalWritable := 'False'} : Bool;   // Memoria de flanco de Push
+      PopMem { ExternalWritable := 'False'} : Bool;   // Memoria de flanco de Pop
       ClearMem { ExternalWritable := 'False'} : Bool;   // Memoria de flanco de Clear
-      LastError : Word;   // Ultimo error, retenido hasta Clear
-      ErrorCount : DInt;   // Errores acumulados,  se borra con ResetDiag
+      LastError { ExternalAccessible := 'False'; ExternalVisible := 'False'; ExternalWritable := 'False'} : Word;   // Ultimo error, retenido hasta Clear
+      ErrorCount { ExternalAccessible := 'False'; ExternalVisible := 'False'; ExternalWritable := 'False'} : DInt;   // Errores acumulados,  se borra con ResetDiag
    END_STRUCT;
 
 END_TYPE
 
 DATA_BLOCK "DB_Test"
 { S7_Optimized_Access := 'TRUE' }
-VERSION : 0.1
+VERSION : 1.1
 NON_RETAIN
    VAR 
       FifoPrueba { S7_SetPoint := 'False'} : "UDT_FIFO";   // FIFO bajo prueba
